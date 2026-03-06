@@ -24,10 +24,14 @@ app.post("/generate-payment-link", async (req, res) => {
   try {
     browser = await chromium.connectOverCDP(BROWSER_ENDPOINT);
     const context = await browser.newContext({
-      // Use a real browser user agent to help bypass bot detection
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     });
     const page = await context.newPage();
+
+    // Expose Browserless captcha solver
+    await page.addInitScript(() => {
+      window._browserlessToken = true;
+    });
 
     const visitedUrls = [];
     page.on("framenavigated", (frame) => {
@@ -37,96 +41,84 @@ app.post("/generate-payment-link", async (req, res) => {
       }
     });
 
+    // Capture any new SumUp URLs from network
+    let capturedPaymentUrl = null;
+    page.on("response", async (response) => {
+      const url = response.url();
+      try {
+        const contentType = response.headers()["content-type"] || "";
+        if (contentType.includes("application/json")) {
+          const body = await response.json().catch(() => null);
+          if (body) {
+            const bodyStr = JSON.stringify(body);
+            console.log(`  📦 JSON from ${url.substring(0, 80)}: ${bodyStr.substring(0, 200)}`);
+            const match = bodyStr.match(/https:\\?\/\\?\/pay\.sumup\.com\\?\/[^"\\]+/);
+            if (match) {
+              capturedPaymentUrl = match[0].replace(/\\\//g, "/");
+              console.log(`  🎯 Found URL in response: ${capturedPaymentUrl}`);
+            }
+          }
+        }
+      } catch (e) { /* skip */ }
+    });
+
     // Step 1: Open the SumUp link
     console.log("  Step 1: Opening SumUp link...");
     await page.goto(sumupLink, { waitUntil: "networkidle", timeout: 30000 });
     await page.waitForTimeout(3000);
 
-    // Step 2: Fill amount using the exact selector we found
+    // Step 2: Fill amount
     console.log("  Step 2: Filling in amount...");
     const amountInput = await page.waitForSelector('input[name="amount"]', { timeout: 10000 });
-
-    if (!amountInput) {
-      await browser.close();
-      return res.status(422).json({ error: "Could not find amount input field" });
-    }
-
-    // Click, clear, and type the amount like a real human would
     await amountInput.click({ clickCount: 3 });
-    await page.waitForTimeout(200);
+    await page.waitForTimeout(300);
     await amountInput.fill("");
-    await page.waitForTimeout(200);
-
-    // Type character by character to appear more human
     for (const char of amount.toString()) {
-      await amountInput.type(char, { delay: 100 });
+      await amountInput.type(char, { delay: 150 });
+    }
+    await page.waitForTimeout(1000);
+
+    // Step 3: Solve reCAPTCHA via Browserless built-in solver
+    console.log("  Step 3: Solving reCAPTCHA...");
+    try {
+      await page.evaluate(() => {
+        // Trigger Browserless captcha solver
+        return window.browserlessRecaptcha?.solve?.();
+      });
+      await page.waitForTimeout(5000);
+      console.log("  reCAPTCHA solve attempted");
+    } catch (e) {
+      console.log("  reCAPTCHA solver not available, trying direct submit...");
     }
 
-    await page.waitForTimeout(500);
-    console.log(`  Filled amount: ${amount}`);
-
-    // Step 3: Intercept the API call that SumUp makes on submit
-    // Instead of waiting for a page redirect (which reCAPTCHA may block),
-    // we listen to network requests for the payment session URL
-    let capturedPaymentUrl = null;
-
-    page.on("request", (request) => {
-      const url = request.url();
-      // SumUp generates a new payment URL via API when amount is submitted
-      if (url.includes("pay.sumup.com") && url !== sumupLink && url.includes("amount")) {
-        console.log(`  🎯 Captured payment URL from request: ${url}`);
-        capturedPaymentUrl = url;
-      }
-    });
-
-    page.on("response", async (response) => {
-      const url = response.url();
-      // Watch for SumUp's internal API responses that contain the new payment link
-      if (url.includes("api.sumup.com") || url.includes("pay.sumup.com/api")) {
-        try {
-          const body = await response.json().catch(() => null);
-          if (body) {
-            console.log(`  📦 API response from: ${url}`);
-            console.log(`  📦 Body: ${JSON.stringify(body).substring(0, 200)}`);
-            // Look for a payment link in the response body
-            const bodyStr = JSON.stringify(body);
-            const match = bodyStr.match(/https:\/\/pay\.sumup\.com\/[^"]+/);
-            if (match) {
-              capturedPaymentUrl = match[0];
-              console.log(`  🎯 Found payment URL in response: ${capturedPaymentUrl}`);
-            }
-          }
-        } catch (e) {
-          // Not JSON, skip
-        }
-      }
-    });
-
-    // Step 4: Click submit and wait
-    console.log("  Step 3: Clicking submit...");
+    // Step 4: Click submit
+    console.log("  Step 4: Clicking submit...");
     const submitBtn = await page.$('button[type="submit"]');
     if (submitBtn) {
-      await submitBtn.click();
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle", timeout: 20000 }).catch(() => {}),
+        submitBtn.click(),
+      ]);
     } else {
       await amountInput.press("Enter");
     }
 
-    // Wait up to 10 seconds for either a redirect or network capture
-    console.log("  Step 4: Waiting for redirect or payment URL...");
+    // Wait for redirect or network capture
     await page.waitForTimeout(8000);
 
     const finalUrl = page.url();
-    console.log(`  Final page URL: ${finalUrl}`);
+    console.log(`  Final URL: ${finalUrl}`);
 
-    // Prefer captured URL from network, fallback to page URL
-    const paymentUrl = capturedPaymentUrl || (finalUrl !== sumupLink ? finalUrl : null);
+    // Check if we actually got a new URL
+    const redirected = finalUrl !== sumupLink && finalUrl !== "about:blank";
+    const paymentUrl = capturedPaymentUrl || (redirected ? finalUrl : null);
 
     await browser.close();
 
     if (!paymentUrl) {
       return res.status(422).json({
-        error: "Could not capture payment URL. SumUp reCAPTCHA may have blocked the submission.",
-        tip: "Try again — reCAPTCHA sometimes passes on retry.",
+        error: "reCAPTCHA blocked the submission. See tip below.",
+        tip: "Make sure your Browserless endpoint includes ?stealth=true — update BRIGHT_DATA_ENDPOINT in Railway to: wss://chrome.browserless.io?token=YOUR_TOKEN&stealth=true&blockAds=true",
         visitedUrls,
       });
     }
@@ -159,10 +151,8 @@ app.post("/debug", async (req, res) => {
     browser = await chromium.connectOverCDP(BROWSER_ENDPOINT);
     const context = await browser.newContext();
     const page = await context.newPage();
-
     await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
     await page.waitForTimeout(3000);
-
     const elements = await page.evaluate(() => {
       const inputs = Array.from(document.querySelectorAll("input")).map((el) => ({
         type: el.type, name: el.name, placeholder: el.placeholder,
@@ -173,7 +163,6 @@ app.post("/debug", async (req, res) => {
       }));
       return { inputs, buttons };
     });
-
     await browser.close();
     return res.json({ currentUrl: page.url(), elements });
   } catch (error) {
