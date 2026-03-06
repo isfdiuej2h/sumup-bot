@@ -7,8 +7,34 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const BROWSER_ENDPOINT = process.env.BRIGHT_DATA_ENDPOINT;
 
+// Optional: your own SOCKS5 proxy
+// Format in env: socks5://username:password@host:port
+// Or without auth: socks5://host:port
+const PROXY_URL = process.env.PROXY_URL || null;
+
+function buildContextOptions() {
+  const options = {
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  };
+
+  if (PROXY_URL) {
+    console.log(`  Using proxy: ${PROXY_URL.replace(/:\/\/.*@/, "://***@")}`); // hide credentials in logs
+    const proxyUrl = new URL(PROXY_URL);
+    options.proxy = {
+      server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyUrl.port}`,
+      ...(proxyUrl.username && { username: decodeURIComponent(proxyUrl.username) }),
+      ...(proxyUrl.password && { password: decodeURIComponent(proxyUrl.password) }),
+    };
+  }
+
+  return options;
+}
+
 app.post("/generate-payment-link", async (req, res) => {
-  const { sumupLink, amount } = req.body;
+  const { sumupLink, amount, proxy } = req.body;
+
+  // Allow per-request proxy override via body
+  const proxyToUse = proxy || PROXY_URL;
 
   if (!sumupLink || !amount) {
     return res.status(400).json({ error: "Missing required fields: sumupLink and amount" });
@@ -23,15 +49,26 @@ app.post("/generate-payment-link", async (req, res) => {
   let browser;
   try {
     browser = await chromium.connectOverCDP(BROWSER_ENDPOINT);
-    const context = await browser.newContext({
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    });
-    const page = await context.newPage();
 
-    // Expose Browserless captcha solver
-    await page.addInitScript(() => {
-      window._browserlessToken = true;
-    });
+    // Build context with optional proxy
+    const contextOptions = {
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    };
+
+    if (proxyToUse) {
+      console.log(`  Using proxy: ${proxyToUse.replace(/:\/\/.*@/, "://***@")}`);
+      const proxyUrl = new URL(proxyToUse);
+      contextOptions.proxy = {
+        server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyUrl.port}`,
+        ...(proxyUrl.username && { username: decodeURIComponent(proxyUrl.username) }),
+        ...(proxyUrl.password && { password: decodeURIComponent(proxyUrl.password) }),
+      };
+    } else {
+      console.log("  No proxy configured — using Browserless default IP");
+    }
+
+    const context = await browser.newContext(contextOptions);
+    const page = await context.newPage();
 
     const visitedUrls = [];
     page.on("framenavigated", (frame) => {
@@ -41,7 +78,7 @@ app.post("/generate-payment-link", async (req, res) => {
       }
     });
 
-    // Capture any new SumUp URLs from network
+    // Capture payment URL from network responses
     let capturedPaymentUrl = null;
     page.on("response", async (response) => {
       const url = response.url();
@@ -51,7 +88,7 @@ app.post("/generate-payment-link", async (req, res) => {
           const body = await response.json().catch(() => null);
           if (body) {
             const bodyStr = JSON.stringify(body);
-            console.log(`  📦 JSON from ${url.substring(0, 80)}: ${bodyStr.substring(0, 200)}`);
+            console.log(`  📦 JSON from ${url.substring(0, 80)}: ${bodyStr.substring(0, 300)}`);
             const match = bodyStr.match(/https:\\?\/\\?\/pay\.sumup\.com\\?\/[^"\\]+/);
             if (match) {
               capturedPaymentUrl = match[0].replace(/\\\//g, "/");
@@ -62,7 +99,7 @@ app.post("/generate-payment-link", async (req, res) => {
       } catch (e) { /* skip */ }
     });
 
-    // Step 1: Open the SumUp link
+    // Step 1: Open page
     console.log("  Step 1: Opening SumUp link...");
     await page.goto(sumupLink, { waitUntil: "networkidle", timeout: 30000 });
     await page.waitForTimeout(3000);
@@ -78,21 +115,17 @@ app.post("/generate-payment-link", async (req, res) => {
     }
     await page.waitForTimeout(1000);
 
-    // Step 3: Solve reCAPTCHA via Browserless built-in solver
-    console.log("  Step 3: Solving reCAPTCHA...");
+    // Step 3: Try reCAPTCHA solver
+    console.log("  Step 3: Attempting reCAPTCHA solve...");
     try {
-      await page.evaluate(() => {
-        // Trigger Browserless captcha solver
-        return window.browserlessRecaptcha?.solve?.();
-      });
+      await page.evaluate(() => window.browserlessRecaptcha?.solve?.());
       await page.waitForTimeout(5000);
-      console.log("  reCAPTCHA solve attempted");
     } catch (e) {
-      console.log("  reCAPTCHA solver not available, trying direct submit...");
+      console.log("  reCAPTCHA solver not triggered");
     }
 
-    // Step 4: Click submit
-    console.log("  Step 4: Clicking submit...");
+    // Step 4: Submit
+    console.log("  Step 4: Submitting...");
     const submitBtn = await page.$('button[type="submit"]');
     if (submitBtn) {
       await Promise.all([
@@ -103,13 +136,9 @@ app.post("/generate-payment-link", async (req, res) => {
       await amountInput.press("Enter");
     }
 
-    // Wait for redirect or network capture
     await page.waitForTimeout(8000);
 
     const finalUrl = page.url();
-    console.log(`  Final URL: ${finalUrl}`);
-
-    // Check if we actually got a new URL
     const redirected = finalUrl !== sumupLink && finalUrl !== "about:blank";
     const paymentUrl = capturedPaymentUrl || (redirected ? finalUrl : null);
 
@@ -117,8 +146,8 @@ app.post("/generate-payment-link", async (req, res) => {
 
     if (!paymentUrl) {
       return res.status(422).json({
-        error: "reCAPTCHA blocked the submission. See tip below.",
-        tip: "Make sure your Browserless endpoint includes ?stealth=true — update BRIGHT_DATA_ENDPOINT in Railway to: wss://chrome.browserless.io?token=YOUR_TOKEN&stealth=true&blockAds=true",
+        error: "Could not capture payment URL — reCAPTCHA likely blocked submission.",
+        tip: "Try passing a high-quality SOCKS5 proxy in the request body: { proxy: 'socks5://user:pass@host:port' }",
         visitedUrls,
       });
     }
@@ -145,7 +174,6 @@ app.post("/generate-payment-link", async (req, res) => {
 app.post("/debug", async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: "Missing url" });
-
   let browser;
   try {
     browser = await chromium.connectOverCDP(BROWSER_ENDPOINT);
@@ -185,3 +213,4 @@ app.listen(PORT, () => {
 ╚══════════════════════════════════════════╝
   `);
 });
+
