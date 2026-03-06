@@ -5,7 +5,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const BRIGHT_DATA_ENDPOINT = process.env.BRIGHT_DATA_ENDPOINT; // wss://USERNAME:PASSWORD@brd.superproxy.io:9222
+const BROWSER_ENDPOINT = process.env.BRIGHT_DATA_ENDPOINT;
 
 /**
  * POST /generate-payment-link
@@ -19,7 +19,7 @@ app.post("/generate-payment-link", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields: sumupLink and amount" });
   }
 
-  if (!BRIGHT_DATA_ENDPOINT) {
+  if (!BROWSER_ENDPOINT) {
     return res.status(500).json({ error: "BRIGHT_DATA_ENDPOINT environment variable not set" });
   }
 
@@ -27,12 +27,10 @@ app.post("/generate-payment-link", async (req, res) => {
 
   let browser;
   try {
-    // Connect to Bright Data's remote Scraping Browser
-    browser = await chromium.connectOverCDP(BRIGHT_DATA_ENDPOINT);
+    browser = await chromium.connectOverCDP(BROWSER_ENDPOINT);
     const context = await browser.newContext();
     const page = await context.newPage();
 
-    // Track all navigation/redirect URLs
     const visitedUrls = [];
     page.on("framenavigated", (frame) => {
       if (frame === page.mainFrame()) {
@@ -41,28 +39,32 @@ app.post("/generate-payment-link", async (req, res) => {
       }
     });
 
-    // Step 1: Open the SumUp amount link
+    // Step 1: Open the SumUp link
     console.log("  Step 1: Opening SumUp link...");
     await page.goto(sumupLink, { waitUntil: "networkidle", timeout: 30000 });
+    await page.waitForTimeout(3000); // Extra wait for JS to render
 
-    // Step 2: Find and fill the amount input field
+    // Step 2: Find amount input
     console.log("  Step 2: Filling in amount...");
-
-    // SumUp uses various selectors for the amount input — try them all
     const amountSelectors = [
       'input[type="number"]',
+      'input[type="text"]',
       'input[name="amount"]',
       'input[placeholder*="amount" i]',
-      'input[placeholder*="Amount" i]',
+      'input[placeholder*="0.00"]',
+      'input[placeholder*="0,00"]',
       'input[data-testid*="amount" i]',
       '.amount-input input',
       'input[class*="amount" i]',
+      'input[class*="Amount" i]',
+      'input[inputmode="decimal"]',
+      'input[inputmode="numeric"]',
     ];
 
     let amountInput = null;
     for (const selector of amountSelectors) {
       try {
-        amountInput = await page.waitForSelector(selector, { timeout: 3000 });
+        amountInput = await page.waitForSelector(selector, { timeout: 2000 });
         if (amountInput) {
           console.log(`  Found amount input with selector: ${selector}`);
           break;
@@ -73,24 +75,26 @@ app.post("/generate-payment-link", async (req, res) => {
     }
 
     if (!amountInput) {
-      // Take a screenshot to help debug
       const screenshot = await page.screenshot({ encoding: "base64" });
+      const html = await page.content();
+      await browser.close();
       return res.status(422).json({
         error: "Could not find amount input field on the page",
         debug: {
           currentUrl: page.url(),
           screenshot: `data:image/png;base64,${screenshot}`,
+          htmlSnippet: html.substring(0, 3000),
         },
       });
     }
 
-    // Clear existing value and type the amount
-    await amountInput.click({ clickCount: 3 }); // Select all
+    // Fill the amount
+    await amountInput.click({ clickCount: 3 });
     await amountInput.fill(amount.toString());
+    await page.waitForTimeout(500);
 
-    // Step 3: Submit the form / trigger redirect
+    // Step 3: Submit
     console.log("  Step 3: Submitting amount...");
-
     const submitSelectors = [
       'button[type="submit"]',
       'button:has-text("Continue")',
@@ -98,6 +102,8 @@ app.post("/generate-payment-link", async (req, res) => {
       'button:has-text("Pay")',
       'button:has-text("Proceed")',
       'button:has-text("Confirm")',
+      'button:has-text("Continua")',
+      'button:has-text("Avanti")',
       '[data-testid*="submit"]',
       '[data-testid*="continue"]',
     ];
@@ -121,16 +127,14 @@ app.post("/generate-payment-link", async (req, res) => {
     }
 
     if (!submitted) {
-      // Try pressing Enter as fallback
+      console.log("  No submit button found, trying Enter key...");
       await Promise.all([
         page.waitForNavigation({ waitUntil: "networkidle", timeout: 15000 }).catch(() => {}),
         amountInput.press("Enter"),
       ]);
     }
 
-    // Step 4: Capture the final payment URL
-    console.log("  Step 4: Capturing payment URL...");
-    await page.waitForTimeout(2000); // Small buffer for any JS redirects
+    await page.waitForTimeout(3000);
 
     const finalUrl = page.url();
     console.log(`  ✅ Final payment URL: ${finalUrl}`);
@@ -147,11 +151,64 @@ app.post("/generate-payment-link", async (req, res) => {
   } catch (error) {
     console.error(`  ❌ Error: ${error.message}`);
     if (browser) await browser.close().catch(() => {});
-
     return res.status(500).json({
       error: "Browser automation failed",
       message: error.message,
     });
+  }
+});
+
+/**
+ * POST /debug
+ * Takes a screenshot + lists all inputs and buttons found on the page
+ * Body: { url: "https://..." }
+ */
+app.post("/debug", async (req, res) => {
+  const { url } = req.body;
+
+  if (!url) return res.status(400).json({ error: "Missing url" });
+
+  let browser;
+  try {
+    browser = await chromium.connectOverCDP(BROWSER_ENDPOINT);
+    const context = await browser.newContext();
+    const page = await context.newPage();
+
+    await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
+    await page.waitForTimeout(3000);
+
+    // Extract all inputs and buttons from the page
+    const elements = await page.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll("input")).map((el) => ({
+        type: el.type,
+        name: el.name,
+        placeholder: el.placeholder,
+        id: el.id,
+        className: el.className,
+        inputmode: el.inputMode,
+      }));
+
+      const buttons = Array.from(document.querySelectorAll("button")).map((el) => ({
+        type: el.type,
+        text: el.innerText?.trim(),
+        id: el.id,
+        className: el.className,
+      }));
+
+      return { inputs, buttons };
+    });
+
+    const screenshot = await page.screenshot({ encoding: "base64", fullPage: true });
+    await browser.close();
+
+    return res.json({
+      currentUrl: page.url(),
+      elements,
+      screenshot: `data:image/png;base64,${screenshot}`,
+    });
+  } catch (error) {
+    if (browser) await browser.close().catch(() => {});
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -162,13 +219,11 @@ app.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════╗
 ║       SumUp Payment Link Bot 🤖          ║
-║  Powered by Bright Data Scraping Browser ║
 ╠══════════════════════════════════════════╣
 ║  Server running on port ${PORT}             ║
 ║                                          ║
 ║  POST /generate-payment-link             ║
-║    Body: { sumupLink, amount }           ║
-║                                          ║
+║  POST /debug                             ║
 ║  GET  /health                            ║
 ╚══════════════════════════════════════════╝
   `);
